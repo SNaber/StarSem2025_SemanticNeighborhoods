@@ -1,0 +1,10 @@
+numpy
+pandas
+tqdm
+matplotlib
+seaborn
+torch
+gensim
+fasttext
+h5py
+sentence-transformers
