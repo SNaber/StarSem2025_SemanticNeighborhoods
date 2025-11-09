@@ -69,9 +69,6 @@ class SemanticSpaceAnalyzer:
     def load(self, filename: str):
         """
         Load semantic space data.
-        Supports:
-          - .pkl / .bin  → binary pickle format
-          - .json        → legacy JSON formats
         """
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File '{filename}' not found.")
@@ -88,43 +85,8 @@ class SemanticSpaceAnalyzer:
                 print(f"Loaded binary semantic space "
                       f"({len(self.vocab)} vocab entries, {len(self.data)} spaces).")
                 return
-        except Exception:
-            pass  # Fall back to JSON
-
-        # Try JSON
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                data = json.load(f)
         except json.JSONDecodeError as e:
-            raise ValueError(f"File '{filename}' is not valid pickle or JSON: {e}")
-
-        if "vocab" in data and "spaces" in data:
-            # Compact JSON
-            self.vocab = data["vocab"]
-            self.word_to_index = {w: i for i, w in enumerate(self.vocab)}
-            self.index_to_word = {i: w for i, w in enumerate(self.vocab)}
-            self.data = {
-                name: {int(wid): [(int(nid), float(score)) for nid, score in neighs]
-                       for wid, neighs in space.items()}
-                for name, space in data["spaces"].items()
-            }
-            print(f"Loaded compact JSON ({len(self.vocab)} vocab entries, {len(self.data)} spaces).")
-        else:
-            # Legacy word-based JSON
-            all_keys = {w for space in data.values() for w in space.keys()}
-            self.vocab = sorted(all_keys)
-            self.word_to_index = {w: i for i, w in enumerate(self.vocab)}
-            self.index_to_word = {i: w for i, w in enumerate(self.vocab)}
-            self.data = {}
-            for name, space in data.items():
-                self.data[name] = {
-                    self.word_to_index[w]: [
-                        (self.word_to_index.get(n, -1), float(s))
-                        for n, s in neighs if n in self.word_to_index
-                    ]
-                    for w, neighs in space.items()
-                }
-            print("Loaded legacy word-based JSON (converted to index format).")
+            raise ValueError(f"File '{filename}' is not valid pickle: {e}")
 
     # ------------------------------------------------------------------
     # Utilities
@@ -182,7 +144,7 @@ class SemanticSpaceAnalyzer:
 
         overlaps = []
         band_size = k_end - n_start + 1
-        for wid in tqdm(target_ids, desc="Calculating NAS/NVS", ncols=80):
+        for wid in target_ids:
             if wid not in self.data[space1] or wid not in self.data[space2]:
                 continue
             n1 = self.data[space1][wid][n_start - 1:k_end]
@@ -233,42 +195,184 @@ class SemanticSpaceAnalyzer:
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
-    def visualize_overlap_matrix(self, target_file, spaces, n_kNN_values,
-                                 output_prefix="overlap", show=True):
-        """Visualize pairwise neighborhood overlaps as heatmaps."""
+    def compare_spaces_nas_matrix(self, target_file, spaces, k_values, background_size, title_suffix=None):
+        """
+        Compute NAS matrices between all given spaces for specified k values
+        and save heatmaps.
+
+        Parameters:
+            target_file (str)
+            spaces (list[str])
+            k_values (list[int])
+            background_size (int)
+            title_suffix (str|None): e.g., "abstract" to show in the title
+        """
         import matplotlib.pyplot as plt
         import seaborn as sns
 
-        target_words = self._load_target_keys(target_file)
-        target_ids = [self.word_to_index[w] for w in target_words if w in self.word_to_index]
-
-        for n_kNN in n_kNN_values:
-            matrix = np.zeros((len(spaces), len(spaces)))
+        results = {}
+        for k in k_values:
+            nas_matrix = np.zeros((len(spaces), len(spaces)))
             for i, s1 in enumerate(spaces):
                 for j, s2 in enumerate(spaces):
-                    if s1 not in self.data or s2 not in self.data:
-                        matrix[i, j] = np.nan
-                        continue
-                    overlaps = []
-                    for wid in target_ids:
-                        if wid not in self.data[s1] or wid not in self.data[s2]:
-                            continue
-                        n1 = [x[0] for x in self.data[s1][wid][:n_kNN]]
-                        n2 = [x[0] for x in self.data[s2][wid][:n_kNN]]
-                        overlap = len(set(n1) & set(n2)) / n_kNN
-                        overlaps.append(overlap)
-                    matrix[i, j] = np.mean(overlaps) if overlaps else 0
+                    try:
+                        nas, _, _ = self.calculate_nas_nvs(
+                            target_file=target_file,
+                            space1=s1,
+                            space2=s2,
+                            n_start=1,
+                            k_end=k,
+                            background_size=background_size,
+                        )
+                        nas_matrix[i, j] = nas if nas is not None else np.nan
+                    except Exception:
+                        nas_matrix[i, j] = np.nan
 
-            plt.figure(figsize=(8, 6))
-            sns.heatmap(matrix, annot=True, fmt=".2f", cmap="coolwarm",
-                        xticklabels=spaces, yticklabels=spaces)
-            plt.title(f"Neighborhood Overlap (n_kNN={n_kNN})")
-            plt.xlabel("Space Y")
-            plt.ylabel("Space X")
-            fname = f"{output_prefix}_{n_kNN}.png"
+            results[k] = nas_matrix
+
+            plt.figure(figsize=(10, 8))
+            sns.heatmap(
+                nas_matrix,
+                annot=True,
+                fmt=".2f",
+                cmap="RdBu_r",
+                cbar=True,
+                xticklabels=spaces,
+                yticklabels=spaces,
+                annot_kws={"fontsize": 12},
+            )
+            title = f"NAS – Top-{k}"
+            if title_suffix:
+                title += f" – {title_suffix}"
+            plt.title(title, fontsize=18, fontweight='bold')
+            plt.xlabel("Space Y", fontsize=14)
+            plt.ylabel("Space X", fontsize=14)
+            plt.xticks(fontsize=12)
+            plt.yticks(fontsize=12)
+            fname = f"nas_matrix_top{k}" + (f"_{title_suffix}" if title_suffix else "") + ".png"
             plt.savefig(fname, dpi=300, bbox_inches="tight")
-            print(f"Saved heatmap to {fname}")
-            if show:
-                plt.show()
-            else:
+            plt.close()
+            print(f"Saved NAS matrix heatmap → {fname}")
+
+        return results
+
+
+
+    def plot_difference_heatmaps(self, results, comparisons, spaces, k_values):
+        """
+        Plot ΔNAS heatmaps for selected target label pairs using a global symmetric scale.
+        Expects: results[target_label][k]['nas'] = matrix
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import numpy as np
+
+
+        all_diffs = []
+        for k in k_values:
+            for name_a, name_b in comparisons:
+                mat_a = results[name_a][k]["nas"]
+                mat_b = results[name_b][k]["nas"]
+                all_diffs.append(mat_a - mat_b)
+        global_min = min(np.nanmin(d) for d in all_diffs)
+        global_max = max(np.nanmax(d) for d in all_diffs)
+        max_abs = max(abs(global_min), abs(global_max))
+
+        for k in k_values:
+            for name_a, name_b in comparisons:
+                mat_a = results[name_a][k]["nas"]
+                mat_b = results[name_b][k]["nas"]
+                diff = mat_a - mat_b
+
+
+                plt.figure(figsize=(10, 8))
+                sns.heatmap(
+                    diff,
+                    annot=True,
+                    fmt=".2f",
+                    center=0,
+                    cmap="RdBu_r",
+                    vmin=-max_abs,
+                    vmax=max_abs,
+                    cbar=True,
+                    xticklabels=spaces,
+                    yticklabels=spaces,
+                    annot_kws={"fontsize": 12},
+                )
+                plt.title(f"Δ NAS (Top-{k}) – {name_a} minus {name_b}", fontsize=18, fontweight='bold')
+                plt.xlabel("Space Y", fontsize=14)
+                plt.ylabel("Space X", fontsize=14)
+                plt.xticks(fontsize=12)
+                plt.yticks(fontsize=12)
+                fname = f"diff_nas_top{k}_{name_a}_vs_{name_b}.png"
+                plt.savefig(fname, dpi=300, bbox_inches="tight")
                 plt.close()
+                print(f"Saved ΔNAS heatmap → {fname}")
+
+
+
+    def plot_alignment_profiles_all(
+        self,
+        target_files,
+        target_labels,
+        spaces,
+        background_size,
+        max_k=100,
+        bandwidth=10,
+        step=5,
+    ):
+        """
+        Plot NAS alignment profiles for all unique (space1, space2) pairs.
+        Span increases with k (n_start=1, k_end=end), matching the original visuals.
+        """
+        import matplotlib.pyplot as plt
+        import os
+        import numpy as np
+
+        assert len(target_files) == len(target_labels), "Each target file must have a corresponding label"
+
+
+        for i, space1 in enumerate(spaces):
+            for j, space2 in enumerate(spaces):
+                if j <= i:
+                    continue  # skip self-pairs and duplicates
+
+                plt.figure(figsize=(12, 6))
+
+                for target_file, label in zip(target_files, target_labels):
+                    nas_values, x_ticks = [], []
+
+                    # span increases: [1 .. end], we advance 'end' with a sliding center step
+                    for start in range(1, max_k - bandwidth + 2, step):
+                        end = start + bandwidth - 1
+                        try:
+                            nas, _, _ = self.calculate_nas_nvs(
+                                target_file=target_file,
+                                space1=space1,
+                                space2=space2,
+                                n_start=1,          
+                                k_end=end,          
+                                background_size=background_size,
+                            )
+                            nas_values.append(nas)
+                            x_ticks.append((start + end) // 2)
+                        except Exception:
+                            nas_values.append(np.nan)
+                            x_ticks.append((start + end) // 2)
+
+
+                    plt.plot(x_ticks, nas_values, marker="o", label=f"NAS – {label}", linewidth=2)
+
+                plt.xlabel("Neighborhood Rank Center", fontsize=14)
+                plt.ylabel("Score", fontsize=14)
+                plt.title(f"Alignment Profiles: {space1} vs {space2}", fontsize=18, fontweight='bold')
+                plt.xticks(fontsize=12)
+                plt.yticks(fontsize=12)
+                plt.grid(True, which='both', linestyle='--', linewidth=0.6)
+                plt.legend(fontsize=12)
+                plt.tight_layout()
+
+                out_path = f"alignment_profiles_{space1}_vs_{space2}.png"
+                plt.savefig(out_path, dpi=300)
+                plt.close()
+                print(f"Saved profile plot for {space1} vs {space2} → {out_path}")
